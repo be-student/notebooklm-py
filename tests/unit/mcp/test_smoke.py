@@ -81,8 +81,11 @@ class _Response:
 
 @pytest.mark.parametrize("backend", ["web", "android"])
 @pytest.mark.parametrize("first_page_notes", [0, 50])
-async def test_run_uses_current_studio_tools(monkeypatch, backend, first_page_notes) -> None:
-    """Exercise paginated artifact selection and downloads for each backend."""
+@pytest.mark.parametrize("first_page_sources", [0, 50])
+async def test_run_uses_current_studio_tools(
+    monkeypatch, backend, first_page_notes, first_page_sources
+) -> None:
+    """Exercise paginated source confirmation and artifact selection for each backend."""
     from notebooklm.mcp import _smoke
 
     calls = []
@@ -99,6 +102,15 @@ async def test_run_uses_current_studio_tools(monkeypatch, backend, first_page_no
         async def call_tool(self, name, arguments):
             """Record calls and serve the configured upload, source, and Studio responses."""
             calls.append((name, arguments))
+            if name == "source_list":
+                if first_page_sources and arguments.get("offset", 0) == 0:
+                    return _Result(
+                        {
+                            "sources": [{"id": f"existing-{i}"} for i in range(50)],
+                            "has_more": True,
+                        }
+                    )
+                return _Result({"sources": [{"id": "source-1"}], "has_more": False})
             if name == "studio_list":
                 if first_page_notes and arguments.get("offset", 0) == 0:
                     return _Result(
@@ -122,7 +134,6 @@ async def test_run_uses_current_studio_tools(monkeypatch, backend, first_page_no
                 )
             responses = {
                 "source_add": _Result({"status": "upload_required", "url": "https://x/upload"}),
-                "source_list": _Result({"sources": [{"id": "source-1"}]}),
                 "studio_list": _Result(
                     {"items": [{"id": "report-1", "type": "report", "status_label": "ready"}]}
                 ),
@@ -168,14 +179,78 @@ async def test_run_uses_current_studio_tools(monkeypatch, backend, first_page_no
     assert [name for name, _ in calls] == [
         "source_add",
         "source_list",
+        *(["source_list"] if first_page_sources else []),
         "studio_list",
         *(["studio_list"] if first_page_notes else []),
         "studio_download",
     ]
     if first_page_notes:
         assert calls[-2][1]["offset"] == 50
+    source_calls = [arguments for name, arguments in calls if name == "source_list"]
+    assert [arguments["offset"] for arguments in source_calls] == (
+        [0, 50] if first_page_sources else [0]
+    )
     assert calls[-1][1]["artifact_id"] == "report-1"
     assert calls[-1][1]["artifact_type"] == ("slide-deck" if backend == "android" else "report")
+
+
+@pytest.mark.parametrize("empty_second_page", [False, True])
+async def test_run_rejects_missing_source_after_paginating(
+    monkeypatch, capsys, empty_second_page
+) -> None:
+    """Stop on true absence and reject a malformed empty page advertising more items."""
+    from notebooklm.mcp import _smoke
+
+    offsets = []
+
+    class FakeMcp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def call_tool(self, name, arguments):
+            if name == "source_add":
+                return _Result({"status": "upload_required", "url": "https://x/upload"})
+            assert name == "source_list"
+            offsets.append(arguments["offset"])
+            if arguments["offset"] == 0:
+                return _Result({"sources": [{"id": "existing"}], "has_more": True})
+            return _Result({"sources": [], "has_more": empty_second_page})
+
+    class FakeHttp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, **_kwargs):
+            return _Response(payload={"source_id": "new-source"})
+
+    monkeypatch.setattr("fastmcp.Client", lambda _transport: FakeMcp())
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_kwargs: FakeHttp())
+    args = _smoke.parse_args(
+        [
+            "--base-url",
+            "https://mcp.example.com",
+            "--bearer",
+            "token",
+            "--notebook",
+            "nb",
+            "--skip-download",
+        ]
+    )
+
+    assert await _smoke.run(args) is False
+    assert offsets == [0, 1]
+    output = capsys.readouterr().out
+    assert (
+        "reported more items but returned an empty page"
+        if empty_second_page
+        else "uploaded source not found in source_list"
+    ) in output
 
 
 async def test_run_rejects_cleartext_before_attaching_bearer(capsys) -> None:

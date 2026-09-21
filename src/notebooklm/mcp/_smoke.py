@@ -163,13 +163,24 @@ async def run(args: argparse.Namespace) -> bool:
             return False
         print(f"  PASS  uploaded source {source_id}")
 
-        listing = await mcp.call_tool("source_list", {"notebook": args.notebook})
-        source_ids = [source.get("id") for source in _structured(listing).get("sources", [])]
-        if source_id in source_ids:
-            print("  PASS  source confirmed live in source_list")
-        else:
-            print("  FAIL  uploaded source not found in source_list")
-            passed = False
+        source_offset = 0
+        while True:
+            listing = await mcp.call_tool(
+                "source_list", {"notebook": args.notebook, "offset": source_offset}
+            )
+            page = _structured(listing)
+            sources = page.get("sources", [])
+            if source_id in (source.get("id") for source in sources):
+                print("  PASS  source confirmed live in source_list")
+                break
+            if not page.get("has_more"):
+                print("  FAIL  uploaded source not found in source_list")
+                passed = False
+                break
+            if not sources:
+                print("  FAIL  source_list reported more items but returned an empty page")
+                return False
+            source_offset += len(sources)
 
         if args.skip_download:
             print("Download round-trip: skipped (--skip-download)")
