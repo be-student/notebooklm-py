@@ -87,7 +87,7 @@ _WIDGET_HTML = """<!doctype html>
  const post=m=>{try{window.parent.postMessage(m,"*")}catch(e){}};
  const oai=window.openai;               // ChatGPT/Grok inject this; claude.ai does not
  const hasNative=!!(oai&&typeof oai.uploadFile==="function");  // OpenAI native upload (interop signal)
- let initialized=false, uploadUrls=null;  // a POOL of single-use tokens, one per file
+ let initialized=false, uploadUrls=null, frozen=0;  // keep uncertain outcomes across batch retries
  let confirmSpec=null;  // {tool,arg,values}: the auto-confirm contract fired after a successful upload
  let cfSeq=0;  // strictly-monotonic JSON-RPC id counter — unique per confirm even for same-ms completions
  const geturls=o=>o&&((Array.isArray(o.upload_urls)&&o.upload_urls.length&&o.upload_urls)||(o.upload_url&&[o.upload_url]))||null;
@@ -158,7 +158,7 @@ _WIDGET_HTML = """<!doctype html>
    const n=Math.min(files.length,cap);
    // FREEZE the selection: retry maps files[i]→uploadUrls[i] by index, so the file list must not
    // change between clicks (a fresh batch = re-invoke the tool for a new token pool).
-   btn.disabled=true; fi.disabled=true; let ok=0, failed=0, skipped=0, frozen=0;
+   btn.disabled=true; fi.disabled=true; let ok=0, failed=0, skipped=0;
    for(let i=0;i<n;i++){ const file=files[i], tok=uploadUrls[i];
      if(!tok){skipped++;log("• "+file.name+": upload link retired");continue;} // token consumed on a prior click
      if(file.size>200*1024*1024){log("❌ "+file.name+": exceeds 200 MB — skipped");failed++;continue;} // mirrors MAX_UPLOAD_BYTES

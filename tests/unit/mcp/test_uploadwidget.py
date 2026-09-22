@@ -83,7 +83,8 @@ def test_widget_html_confirms_committed_outcomes() -> None:
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is needed for widget execution")
-def test_widget_retires_frozen_link_without_retry() -> None:
+@pytest.mark.parametrize("mixed_batch", [False, True])
+def test_widget_retires_frozen_link_without_retry(mixed_batch: bool) -> None:
     """Execute the widget to verify that unconfirmed uploads retire their single-use link."""
     script = _WIDGET_HTML.split('<script type="module">', 1)[1].split("</script>", 1)[0]
     harness = r"""
@@ -94,16 +95,24 @@ const elements = Object.fromEntries(['sub', 'out', 'f', 'up'].map(id => [id, {
   addEventListener(event, fn) { this.listeners[event] = fn; }
 }]));
 const confirms = [];
-let requests = 0;
+let requests = 0, retryRequests = 0;
+const mixedBatch = MIXED_BATCH;
 const context = {
   document: { getElementById: id => elements[id], documentElement: {} },
   window: { parent: {postMessage() {}}, addEventListener() {}, openai: {
-    toolOutput: { upload_urls: ['https://example.test/files/ul/token'],
+    toolOutput: { upload_urls: ['https://example.test/files/ul/token',
+      ...(mixedBatch ? ['https://example.test/files/ul/retry'] : [])],
       confirm: {tool: 'await_upload', arg: 'upload_link'} },
     callTool: async (name, args) => { confirms.push({name, args}); }
   } },
   setTimeout() {}, setInterval() {}, clearInterval() {},
-  fetch: async () => { requests++; return {
+  fetch: async url => { requests++;
+    if (url.includes("/retry?")) {
+      retryRequests++;
+      return {ok: retryRequests > 1, status: retryRequests > 1 ? 200 : 503,
+        headers: {get: () => null}, text: async () => "transient or recovered"};
+    }
+    return {
     ok: false, status: 502,
     headers: {get: name => name === 'X-NotebookLM-Upload-Status' ? 'unconfirmed' : null},
     text: async () => 'registration unconfirmed'
@@ -112,18 +121,26 @@ const context = {
 vm.createContext(context);
 vm.runInContext(SCRIPT, context);
 vm.runInContext('pullOai()', context);
-elements.f.files = [{name: 'note.txt', size: 3, type: 'text/plain'}];
+elements.f.files = [{name: 'note.txt', size: 3, type: 'text/plain'},
+  ...(mixedBatch ? [{name: 'retry.txt', size: 3, type: 'text/plain'}] : [])];
 elements.f.listeners.change();
 (async () => {
   await elements.up.listeners.click();
-  assert.equal(elements.up.disabled, true);
+  assert.equal(elements.up.disabled, !mixedBatch);
   assert.match(elements.sub.textContent, /unconfirmed/);
   assert.match(elements.out.textContent, /source_list/);
   assert.equal(confirms.length, 1);
   await elements.up.listeners.click();
-  assert.equal(requests, 1);
+  assert.equal(requests, mixedBatch ? 3 : 1);
+  if (mixedBatch) {
+    assert.equal(elements.up.disabled, true);
+    assert.match(elements.sub.textContent, /1 unconfirmed/);
+    assert.match(elements.sub.textContent, /source_list/);
+    assert.doesNotMatch(elements.sub.textContent, /you can close/);
+    assert.equal(confirms.length, 2);
+  }
 })().catch(error => { console.error(error); process.exitCode = 1; });
-""".replace("SCRIPT", json.dumps(script))
+""".replace("SCRIPT", json.dumps(script)).replace("MIXED_BATCH", json.dumps(mixed_batch))
     subprocess.run(["node", "-e", harness], check=True, capture_output=True, text=True)
 
 
