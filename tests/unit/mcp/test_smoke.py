@@ -87,6 +87,7 @@ async def test_run_uses_current_studio_tools(
 ) -> None:
     """Exercise paginated source confirmation and artifact selection for each backend."""
     from notebooklm.mcp import _smoke
+    from notebooklm.mcp._paginate import DEFAULT_LIMIT, paginate
 
     calls = []
 
@@ -103,14 +104,12 @@ async def test_run_uses_current_studio_tools(
             """Record calls and serve the configured upload, source, and Studio responses."""
             calls.append((name, arguments))
             if name == "source_list":
-                if first_page_sources and arguments.get("offset", 0) == 0:
-                    return _Result(
-                        {
-                            "sources": [{"id": f"existing-{i}"} for i in range(50)],
-                            "has_more": True,
-                        }
-                    )
-                return _Result({"sources": [{"id": "source-1"}], "has_more": False})
+                roster = [{"id": f"existing-{i}"} for i in range(first_page_sources)]
+                roster.append({"id": "source-1"})
+                # A match must stop even if the real helper advertises more pages.
+                roster.extend({"id": f"later-{i}"} for i in range(60))
+                page, meta = paginate(roster, DEFAULT_LIMIT, arguments["offset"])
+                return _Result({"sources": page, **meta})
             if name == "studio_list":
                 if first_page_notes and arguments.get("offset", 0) == 0:
                     return _Result(
@@ -200,6 +199,7 @@ async def test_run_rejects_missing_source_after_paginating(
 ) -> None:
     """Stop on true absence and reject a malformed empty page advertising more items."""
     from notebooklm.mcp import _smoke
+    from notebooklm.mcp._paginate import DEFAULT_LIMIT, paginate
 
     offsets = []
 
@@ -215,9 +215,11 @@ async def test_run_rejects_missing_source_after_paginating(
                 return _Result({"status": "upload_required", "url": "https://x/upload"})
             assert name == "source_list"
             offsets.append(arguments["offset"])
-            if arguments["offset"] == 0:
-                return _Result({"sources": [{"id": "existing"}], "has_more": True})
-            return _Result({"sources": [], "has_more": empty_second_page})
+            if empty_second_page and arguments["offset"]:
+                return _Result({"sources": [], "has_more": True})
+            roster = [{"id": f"existing-{i}"} for i in range(75)]
+            page, meta = paginate(roster, DEFAULT_LIMIT, arguments["offset"])
+            return _Result({"sources": page, **meta})
 
     class FakeHttp:
         async def __aenter__(self):
@@ -244,7 +246,7 @@ async def test_run_rejects_missing_source_after_paginating(
     )
 
     assert await _smoke.run(args) is False
-    assert offsets == [0, 1]
+    assert offsets == [0, 50]
     output = capsys.readouterr().out
     assert (
         "reported more items but returned an empty page"
@@ -328,3 +330,64 @@ async def test_run_redacts_signed_url_from_failure_output(monkeypatch, capsys) -
     assert "status='unexpected'" in output
     assert "keys=['status', 'url']" in output
     assert "secret.example" not in output
+
+
+@pytest.mark.parametrize("status_code", [200, 403])
+async def test_run_redacts_upload_response_body(monkeypatch, capsys, status_code) -> None:
+    """Do not copy capability-bearing HTTP error or malformed success bodies to logs."""
+    import httpx
+
+    from notebooklm.mcp import _smoke
+
+    capability = "https://example.invalid/upload?token=fixture-capability"
+
+    class FakeMcp:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def call_tool(self, name, arguments):
+            assert name == "source_add"
+            return _Result({"status": "upload_required", "url": capability})
+
+    def respond(request):
+        return httpx.Response(status_code, json={"error": str(request.url)})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr("fastmcp.Client", lambda _transport: FakeMcp())
+    monkeypatch.setattr("httpx.AsyncClient", lambda **_kwargs: client)
+    args = _smoke.parse_args(
+        ["--base-url", "https://mcp.example.com", "--bearer", "token", "--notebook", "nb"]
+    )
+    assert await _smoke.run(args) is False
+    output = capsys.readouterr().out
+    assert "FAIL" in output
+    assert "fixture-capability" not in output
+
+
+def test_main_redacts_http_exception_url(monkeypatch, capsys) -> None:
+    """A real HTTP status exception must not expose its signed URL in CLI output."""
+    import httpx
+
+    from notebooklm.mcp import _smoke
+
+    async def fail(_args):
+        response = httpx.Response(
+            403,
+            request=httpx.Request("GET", "https://example.invalid/file?token=fixture-capability"),
+        )
+        response.raise_for_status()
+
+    monkeypatch.setattr(_smoke, "run", fail)
+    assert (
+        _smoke.main(
+            ["--base-url", "https://mcp.example.com", "--bearer", "token", "--notebook", "nb"]
+        )
+        == 1
+    )
+    output = capsys.readouterr().out
+    assert "RESULT: FAIL" in output
+    assert "HTTPStatusError" in output
+    assert "fixture-capability" not in output

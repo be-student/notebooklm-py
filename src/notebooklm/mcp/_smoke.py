@@ -155,11 +155,11 @@ async def run(args: argparse.Namespace) -> bool:
             headers={"Accept": "application/json", "Content-Type": "text/plain"},
         )
         if up.status_code != 200:
-            print(f"  FAIL  upload POST returned {up.status_code}: {up.text}")
+            print(f"  FAIL  upload POST returned {up.status_code} ({len(up.content)} bytes)")
             return False
         source_id = up.json().get("source_id")
         if not source_id:
-            print(f"  FAIL  upload response missing source_id: {up.text}")
+            print("  FAIL  upload response missing source_id")
             return False
         print(f"  PASS  uploaded source {source_id}")
 
@@ -241,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         passed = asyncio.run(run(args))
     except Exception as exc:  # noqa: BLE001 - top-level smoke reports one clean failure
-        print(f"  FAIL  unexpected error: {exc}")
+        # Exception messages can contain signed URLs or server response bodies.
+        print(f"  FAIL  unexpected error: {type(exc).__name__}")
         passed = False
     print()
     print("RESULT: PASS" if passed else "RESULT: FAIL")
